@@ -10,14 +10,22 @@
 #include <stdio.h>
 #include <errno.h>
 #include <limits.h>
-#include <getopt.h>
-#include <sys/socket.h>
-#include <netinet/in.h>
-#include <netdb.h>
-#include <sys/select.h>
-#include <fcntl.h>
-#include <sys/stat.h>
+#ifndef WINCE
+#  include <getopt.h>
+#  include <sys/stat.h>
+#  include <sys/socket.h>
+#  include <netinet/in.h>
+#  include <netdb.h>
+#  include <sys/select.h>
+#  include <fcntl.h>
+#else
+#  include <winsock2.h>
+#endif
 #include "websocket.h"
+
+#define handler_msg(x) 
+#define handler_emsg(x) 
+#define printf(x)
 
 char traffic_legend[] = "\n\
 Traffic Legend:\n\
@@ -31,34 +39,34 @@ Traffic Legend:\n\
     <. - Client send partial\n\
 ";
 
-char USAGE[] = "Usage: [options] " \
-               "[source_addr:]source_port target_addr:target_port\n\n" \
-               "  --verbose|-v       verbose messages and per frame traffic\n" \
-               "  --daemon|-D        become a daemon (background process)\n" \
-               "  --cert CERT        SSL certificate file\n" \
-               "  --key KEY          SSL key file (if separate from cert)\n" \
-               "  --ssl-only         disallow non-encrypted connections";
+char USAGE[] = "Usage: [options]  \
+[source_addr:]source_port target_addr:target_port\n\n \
+  --verbose|-v       verbose messages and per frame traffic\n \
+  --daemon|-D        become a daemon (background process)\n \
+  --cert CERT        SSL certificate file\n \
+  --key KEY          SSL key file (if separate from cert)\n \
+  --ssl-only         disallow non-encrypted connections";
 
-#define usage(fmt, args...) \
+#define usage(fmt, args)  /*\
     fprintf(stderr, "%s\n\n", USAGE); \
     fprintf(stderr, fmt , ## args); \
-    exit(1);
+    exit(1);*/
 
 char target_host[256];
 int target_port;
 
-extern pipe_error;
+extern int pipe_error;
 extern settings_t settings;
 extern char *tbuf, *cbuf, *tbuf_tmp, *cbuf_tmp;
 extern unsigned int bufsize, dbufsize;
 
-void do_proxy(ws_ctx_t *ws_ctx, int target) {
+void do_proxy(ws_ctx_t *ws_ctx, int target, bool useHixie) {
     fd_set rlist, wlist, elist;
     struct timeval tv;
     int i, maxfd, client = ws_ctx->sockfd;
     unsigned int tstart, tend, cstart, cend, ret;
     ssize_t len, bytes;
-
+    
     tstart = tend = cstart = cend = 0;
     maxfd = client > target ? client+1 : target+1;
 
@@ -88,20 +96,20 @@ void do_proxy(ws_ctx_t *ws_ctx, int target) {
             FD_SET(client, &wlist);
         }
 
-        ret = select(maxfd, &rlist, &wlist, &elist, &tv);
+        ret = select(0, &rlist, &wlist, NULL, &tv);
         if (pipe_error) { break; }
 
-        if (FD_ISSET(target, &elist)) {
+        /*if (FD_ISSET(target, &elist)) {
             handler_emsg("target exception\n");
             break;
         }
         if (FD_ISSET(client, &elist)) {
             handler_emsg("client exception\n");
             break;
-        }
+        }*/
 
         if (ret == -1) {
-            handler_emsg("select(): %s\n", strerror(errno));
+            handler_emsg("select(): %d\n", WSAGetLastError());
             break;
         } else if (ret == 0) {
             //handler_emsg("select timeout\n");
@@ -150,7 +158,14 @@ void do_proxy(ws_ctx_t *ws_ctx, int target) {
                 break;
             }
             cstart = 0;
-            cend = encode(cbuf_tmp, bytes, cbuf, bufsize);
+            if (useHixie)
+            {
+               cend = encode_hixie((const u_char*)cbuf_tmp, bytes, cbuf, bufsize);
+            }
+            else
+            {
+               cend = encode_hybi((const u_char*)cbuf_tmp, bytes, cbuf, bufsize, 0x1);
+            }
             /*
             printf("encoded: ");
             for (i=0; i< cend; i++) {
@@ -184,7 +199,14 @@ void do_proxy(ws_ctx_t *ws_ctx, int target) {
             }
             printf("\n");
             */
-            len = decode(tbuf_tmp, bytes, tbuf, bufsize-1);
+            if (useHixie)
+            {
+               len = decode_hixie(tbuf_tmp, bytes, (u_char*)tbuf, bufsize-1);
+            }
+            else
+            {
+               len = decode_hybi(tbuf_tmp, bytes, (u_char*)tbuf, bufsize-1);
+            }
             /*
             printf("decoded: ");
             for (i=0; i< len; i++) {
@@ -203,7 +225,7 @@ void do_proxy(ws_ctx_t *ws_ctx, int target) {
     }
 }
 
-void proxy_handler(ws_ctx_t *ws_ctx) {
+void proxy_handler(ws_ctx_t *ws_ctx, bool useHixie) {
     int tsock = 0;
     struct sockaddr_in taddr;
 
@@ -236,38 +258,46 @@ void proxy_handler(ws_ctx_t *ws_ctx) {
         printf("%s", traffic_legend);
     }
 
-    do_proxy(ws_ctx, tsock);
+    do_proxy(ws_ctx, tsock, useHixie);
 
     close(tsock);
 }
 
+struct option
+{
+   char* a;
+   int b;
+   int* c;
+   char d;
+};
+
 int main(int argc, char *argv[])
 {
-    int fd, c, option_index = 0;
+    int fd, c, option_index = 0, optind = 0;
     static int ssl_only = 0, daemon = 0, verbose = 0;
     char *found;
-    static struct option long_options[] = {
+    /*static struct option long_options[] = {
         {"verbose",    no_argument,       &verbose,    'v'},
         {"ssl-only",   no_argument,       &ssl_only,    1 },
         {"daemon",     no_argument,       &daemon,     'D'},
-        /* ---- */
+        /* ---- *
         {"cert",       required_argument, 0,           'c'},
         {"key",        required_argument, 0,           'k'},
         {0, 0, 0, 0}
-    };
+    };*/
 
-    settings.cert = realpath("self.pem", NULL);
+    settings.cert = 0;
     if (!settings.cert) {
         /* Make sure it's always set to something */
         settings.cert = "self.pem";
     }
     settings.key = "";
 
-    while (1) {
+    /*while (1) {
         c = getopt_long (argc, argv, "vDc:k:",
                          long_options, &option_index);
 
-        /* Detect the end */
+        /* Detect the end *
         if (c == -1) { break; }
 
         switch (c) {
@@ -296,10 +326,11 @@ int main(int argc, char *argv[])
             default:
                 usage("");
         }
-    }
-    settings.verbose      = verbose;
-    settings.ssl_only     = ssl_only;
-    settings.daemon       = daemon;
+    }*/
+    settings.verbose      = 0;
+    settings.ssl_only     = 0;
+    settings.daemon       = 0;
+    optind = 1;
 
     if ((argc-optind) != 2) {
         usage("Invalid number of arguments\n");
